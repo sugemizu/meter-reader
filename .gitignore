@@ -7,3 +7,7 @@ cmp.png
 flat3.png
 synth_preview.png
 cell3.png
+
+# 作業環境のホームディレクトリ設定（トークン等を含むため除外）
+.*
+!.gitignore

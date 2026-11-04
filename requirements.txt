@@ -1,0 +1,7 @@
+torch
+onnx
+onnxscript
+onnxruntime
+opencv-python-headless
+pillow
+rapidocr-onnxruntime

@@ -1,0 +1,9 @@
+data/
+in/
+debug_*
+*.pt
+__pycache__/
+cmp.png
+flat3.png
+synth_preview.png
+cell3.png

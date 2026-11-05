@@ -51,17 +51,40 @@ def find_fonts():
     PC に入っている太めのサンセリフ体フォント（.ttf）を探して、パスの一覧を返す。
     Windows/Mac などで見つからない場合は、プロジェクト内の fonts/ フォルダにも探しに行く。
     """
-    # /usr/share/fonts 以下を再帰的に検索 + fonts/ フォルダも検索
-    cands = glob.glob("/usr/share/fonts/**/*.ttf", recursive=True) + glob.glob("fonts/*.ttf")
+    # OS ごとのフォント置き場 + プロジェクト内の fonts/ フォルダを検索
+    dirs = [
+        "fonts",                                              # プロジェクト内（最優先。手動で入れたもの）
+        "/usr/share/fonts", "/usr/local/share/fonts",         # Linux
+        os.path.expanduser("~/.fonts"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),                       # Windows
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),   # Windows（ユーザー別）
+        "/Library/Fonts", "/System/Library/Fonts", os.path.expanduser("~/Library/Fonts"),    # Mac
+    ]
+    cands = []
+    for d in dirs:
+        if d and os.path.isdir(d):
+            cands += glob.glob(os.path.join(d, "**", "*.ttf"), recursive=True)
+            cands += glob.glob(os.path.join(d, "**", "*.TTF"), recursive=True)
+
     # ファイル名にこれらの文字列を含むものを「太めのサンセリフ」とみなす
-    keys = ("sans-bold", "sansbold", "poppins-bold", "poppins-medium", "carlito-bold", "arial", "roboto", "helvetica")
-    # 条件に合い、かつ斜体（italic / oblique）でないものだけ残す
+    #   Linux : DejaVuSans-Bold, LiberationSans-Bold, Poppins-Bold など
+    #   Windows: arialbd (Arial Bold), ariblk (Arial Black), calibrib, verdanab, tahomabd, segoeuib など
+    keys = (
+        "sans-bold", "sansbold", "poppins-bold", "poppins-medium", "carlito-bold", "roboto-bold", "helvetica",
+        "arialbd", "ariblk", "calibrib", "verdanab", "tahomabd", "segoeuib", "trebucbd", "consolab",
+    )
+    # 条件に合い、かつ斜体（italic / oblique / Windows の末尾 i, z）でないものだけ残す
+    def is_italic(name):
+        return "italic" in name or "oblique" in name or name.endswith(("bi.ttf", "z.ttf"))
     pref = [f for f in cands
-            if any(k in f.lower() for k in keys)
-            and "italic" not in f.lower()
-            and "oblique" not in f.lower()]
+            if any(k in os.path.basename(f).lower() for k in keys)
+            and not is_italic(os.path.basename(f).lower())]
     # 好みのフォントが 1 つも無ければ、見つかった全フォントを使う
-    return pref or cands
+    found = pref or cands
+    print(f"フォント {len(found)} 個を使用:")
+    for f in found[:20]:
+        print("  ", f)
+    return found
 
 FONTS = find_fonts()
 # フォントが 1 つも無ければエラーで止める（assert = 条件が偽ならエラー）

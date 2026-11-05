@@ -42,6 +42,7 @@ N_PER_CLASS = 2500         # 1 ラベルあたり何枚作るか（20ラベル �
 REVERSE_ROLL_RATE = 0.0    # ドラムが逆方向に回る機種がある場合だけ 0 より大きくする（通常は 0）
 PITCH = 120                # ドラム上での数字と数字の間隔（ピクセル）。大きめに描いて最後に縮小する
 FLAT3_RATE = 0.5           # 「上が平らな3」を使う確率（メーターの3はこの形が多い）
+STRAIGHT69_RATE = 0.5      # 「上がまっすぐな6 / 下がまっすぐな9」を使う確率
 
 
 # ================== フォントを探す ==================
@@ -93,6 +94,43 @@ def draw_flat_top_3(dr, cx, cy, h, fg, width):
     dr.line([(cx - w * 0.05, ym), (x1 - r, ym)], fill=fg, width=width)   # 中央の短い横線
 
 
+# ================== 「直線の6 / 9」を手描きする ==================
+def draw_straight_6(dr, cx, cy, h, fg, width, flip=False):
+    """
+    メーターによくある、直線的な「6」を描く。
+      ・下に丸い輪
+      ・輪の左端から真上に伸びる縦線
+      ・縦線の上端から右へ曲がる短いフック
+    flip=True にすると上下反転して「9」になる。
+    """
+    w = h * 0.55
+    x0, x1 = cx - w / 2, cx + w / 2
+    yt, yb = cy - h / 2, cy + h / 2
+    r = w / 2                                   # 輪の半径（輪の直径 = 数字の幅）
+    loop_cy = yb - r                            # 輪の中心 y（下寄せ）
+    xs = x0 + width / 2                         # 縦線の x（左端）
+    rh = w * random.uniform(0.3, 0.5)           # フックの丸みの半径
+    hook_end = x0 + w * random.uniform(0.6, 1.0)   # フックの右端
+
+    if not flip:
+        dr.ellipse((x0, loop_cy - r, x1, loop_cy + r), outline=fg, width=width)      # 輪
+        dr.line([(xs, loop_cy), (xs, yt + rh)], fill=fg, width=width)                # 縦線
+        dr.arc((xs - width / 2, yt, xs - width / 2 + 2 * rh, yt + 2 * rh),
+               start=180, end=270, fill=fg, width=width)                             # 左上の角を丸く
+        dr.line([(xs + rh - width / 2, yt + width / 2), (hook_end, yt + width / 2)],
+                fill=fg, width=width)                                                # 上のフック
+    else:
+        # 9: 6 を上下反転した形（輪が上、縦線が下へ、フックは下）
+        loop_cy = yt + r
+        dr.ellipse((x0, loop_cy - r, x1, loop_cy + r), outline=fg, width=width)
+        xs9 = x1 - width / 2                    # 9 の縦線は右側
+        dr.line([(xs9, loop_cy), (xs9, yb - rh)], fill=fg, width=width)
+        dr.arc((xs9 + width / 2 - 2 * rh, yb - 2 * rh, xs9 + width / 2, yb),
+               start=0, end=90, fill=fg, width=width)
+        dr.line([(x1 - w * random.uniform(0.6, 1.0), yb - width / 2), (xs9 - rh + width / 2, yb - width / 2)],
+                fill=fg, width=width)
+
+
 # ================== ドラム帯を描く ==================
 def drum_strip(d, font, size, fg, bg, stroke, cw):
     """
@@ -113,6 +151,7 @@ def drum_strip(d, font, size, fg, bg, stroke, cw):
     dr = ImageDraw.Draw(strip)                   # この帯に描くためのペン
     f = ImageFont.truetype(font, size)           # フォントを読み込む
     use_flat3 = random.random() < FLAT3_RATE     # この帯では平らな 3 を使うか？
+    use_s69 = random.random() < STRAIGHT69_RATE  # この帯では直線の 6/9 を使うか？
 
     # フォントごとに文字の実際の高さが違うので、「0」の高さを基準にそろえる
     b0 = dr.textbbox((0, 0), "0", font=f, stroke_width=stroke)   # 0 を描いたときの枠
@@ -128,6 +167,10 @@ def drum_strip(d, font, size, fg, bg, stroke, cw):
             # 3 だけ特別扱い: 手描きの平らな 3
             draw_flat_top_3(dr, cx, cy, glyph_h, fg, max(4, int(glyph_h * 0.13) + stroke))
             continue   # 次の数字へ
+        if s in ("6", "9") and use_s69:
+            # 6 と 9 も特別扱い: 直線的な 6（9 は上下反転）
+            draw_straight_6(dr, cx, cy, glyph_h, fg, max(5, int(glyph_h * 0.17) + stroke), flip=(s == "9"))
+            continue
 
         # 通常の数字: フォントで描く
         bbox = dr.textbbox((0, 0), s, font=f, stroke_width=stroke)   # 文字の枠（左, 上, 右, 下）

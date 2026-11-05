@@ -89,12 +89,17 @@ def box_metrics(gray, box):
     return p, w, h, mean
 
 
+DIGIT_ASPECT = 0.65   # 1 桁の「幅 ÷ 高さ」のおおよその値（実写 2 枚から: 0.6〜0.71）
+
+
 def pick_counter_window(gray, boxes, expect_digits):
     """
     検出された領域すべてにスコアを付けて、一番「数字窓っぽい」ものを返す。
     スコアは 3 つの観点の重み付き合計:
-      s_aspect : 横長さが「桁数 × 0.7」に近いか（1 桁の幅:高さ ≈ 0.7:1 として）  … 重み 0.5
-      s_dark   : 背景が暗いか（黒地白字の窓を優先）                            … 重み 0.3
+      s_dark   : 背景が暗いか（黒地白字の窓は、文字盤の中で飛び抜けて暗い）       … 重み 0.5
+      s_aspect : 横長さが「桁数 × DIGIT_ASPECT」の 55%〜110% に入っているか。
+                 検出器が白地の赤い桁を取りこぼして枠が短くなることがあるので、
+                 ぴったり一致を求めず「範囲内なら満点」にする                    … 重み 0.3
       s_size   : 画像の中で十分大きいか                                        … 重み 0.2
     戻り値: (4点座標, スコア)。候補が無ければ (None, -1)
     """
@@ -104,14 +109,73 @@ def pick_counter_window(gray, boxes, expect_digits):
         if h < 12 or w < 30:        # 小さすぎる領域は無視
             continue
         aspect = w / h                                       # 縦横比
-        target = expect_digits * 0.7                         # 期待する縦横比
-        s_aspect = max(0, 1 - abs(aspect - target) / target) # 期待値に近いほど 1、遠いと 0
-        s_dark = 1 - mean / 255                              # 暗いほど 1
+        target = expect_digits * DIGIT_ASPECT                # 期待する縦横比
+        ratio = aspect / target
+        if 0.55 <= ratio <= 1.1:
+            s_aspect = 1.0                                   # 範囲内なら満点
+        else:
+            s_aspect = max(0, 1 - abs(ratio - 1))            # 外れるほど減点
+        s_dark = (1 - mean / 255) ** 2                       # 暗いほど 1（2 乗で差を強調）
         s_size = min(1, w / (gray.shape[1] * 0.3))           # 画像幅の 30% 以上なら 1
-        score = 0.5 * s_aspect + 0.3 * s_dark + 0.2 * s_size
+        score = 0.5 * s_dark + 0.3 * s_aspect + 0.2 * s_size
         if score > best_score:                               # 今までで最高なら更新
             best, best_score = p, score
     return best, best_score
+
+
+def red_mask(img):
+    """
+    カラー画像から「赤い画素」だけを白にしたマスクを返す。
+    HSV 色空間で判定: 色相 H が 0〜10 または 170〜180（赤は両端にまたがる）、
+    彩度 S が高く（薄い色を除外）、明度 V がある程度ある（黒を除外）。
+    """
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    return (((h <= 10) | (h >= 170)) & (s > 100) & (v > 80)).astype(np.uint8) * 255
+
+
+def extend_to_red_digits(img, p, red_digits):
+    """
+    文字検出器は「黒地に白文字」の窓は見つけるが、その右隣の
+    「白地に赤文字」の小数桁を取りこぼすことが多い。
+    そこで赤い領域を探し、枠の右端をそこまで伸ばす。
+
+    条件: 赤い塊のうち、窓と同じ高さにあり、窓の右端から高さの 3 倍以内にあるもの
+          （文字盤の下の方にある赤い針は高さが違うので除外される）
+      p: 左上, 右上, 右下, 左下 の順の 4 点
+    """
+    if red_digits <= 0:
+        return p
+    h = (np.linalg.norm(p[3] - p[0]) + np.linalg.norm(p[2] - p[1])) / 2
+    y_top, y_bot = min(p[0][1], p[1][1]), max(p[2][1], p[3][1])
+    x_right = max(p[1][0], p[2][0])
+
+    m = red_mask(img)
+    n, _, stats, cent = cv2.connectedComponentsWithStats(m)   # 赤い塊ごとに位置・大きさを取得
+    far_x = None
+    for i in range(1, n):                                      # 0 番は背景なので飛ばす
+        x, y, w_, h_, area = stats[i]
+        cx, cy = cent[i]
+        if area < 15:                                          # 小さすぎるノイズは無視
+            continue
+        if not (y_top - h * 0.2 <= cy <= y_bot + h * 0.2):     # 窓と同じ高さか
+            continue
+        if not (x_right - h * 0.3 <= cx <= x_right + h * 3):   # 窓の右隣か
+            continue
+        far_x = x + w_ if far_x is None else max(far_x, x + w_)   # 一番右の赤の右端
+
+    if far_x is None:
+        return p                                               # 赤が見つからなければそのまま
+    ext = far_x + h * 0.35 - x_right                           # 右端まで + 余白
+    if ext <= 0:
+        return p
+    # 枠は斜めに写っていることもあるので、上辺・下辺の向きに沿って伸ばす
+    top_dir = (p[1] - p[0]) / np.linalg.norm(p[1] - p[0])
+    bot_dir = (p[2] - p[3]) / np.linalg.norm(p[2] - p[3])
+    q = p.copy()
+    q[1] = p[1] + top_dir * ext
+    q[2] = p[2] + bot_dir * ext
+    return q
 
 
 # ======================================================
@@ -158,46 +222,95 @@ def crop_main_band(win, bw):
     return win[a:b], bw[a:b]
 
 
-def split_digits(win, n):
+def _cut_cell(win, c, cw):
+    """窓画像 win から中心 c・幅 cw のセルを切り出し、CNN の入力サイズに縮小する"""
+    w = win.shape[1]
+    a, b = int(round(c - cw / 2)), int(round(c + cw / 2))   # セルの左端・右端
+    pad_l, pad_r = max(0, -a), max(0, b - w)                # 画像からはみ出す量
+    cell = win[:, max(0, a):min(w, b)]
+    if pad_l or pad_r:                                      # はみ出した分は端の画素を伸ばして埋める
+        cell = cv2.copyMakeBorder(cell, 0, 0, pad_l, pad_r, cv2.BORDER_REPLICATE)
+    # 白地（赤い桁など）なら反転して黒地白字にそろえる。
+    # 端に隣の黒い窓が入り込むことがあるので、判定はセルの中央 50% で行う。
+    # 平均だと数字の色に引っ張られるので、中央値（＝面積の多い背景の色）を使う
+    cw_ = cell.shape[1]
+    if np.median(cell[:, cw_ // 4: cw_ - cw_ // 4]) > 127:
+        cell = 255 - cell
+    return cv2.resize(cell, (W, H), interpolation=cv2.INTER_AREA)   # INTER_AREA = 縮小向き
+
+
+def split_digits(win, n, win_color=None, red_digits=0):
     """
     正面化した窓画像 win を n 桁のセルに分割する。
-    単純な等分割だと検出枠の左右の余白でずれるので、
-    「列ごとの白い画素の量」のピーク（＝数字の中心）に各セルの中心を合わせる。
+
+    ・黒い桁（n - red_digits 個）: 「列ごとの白い画素の量」のピーク（＝数字の中心）を探して
+      そこにセルの中心を合わせる（等分割だと枠の余白でずれるため）
+    ・赤い桁（red_digits 個）: 白地に赤なので明るさでは探せない。
+      カラー窓 win_color の赤マスクから、赤い塊の中心をセル中心にする
     戻り値: (セル画像のリスト, 処理後の窓画像)
     """
-    # 背景が明るい（白地黒字）なら反転して、常に「黒地白字」として扱う
-    if win.mean() > 127:
-        win = 255 - win
-    # 二値化（Otsu 法 = しきい値を自動で決める）。bw は白(255)か黒(0)だけの画像
-    _, bw = cv2.threshold(win, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    win, bw = crop_main_band(win, bw)
     h, w = win.shape
-    step = w / n                        # 等分割した場合の 1 桁の幅
+    n_black = n - red_digits
 
-    # 列投影: 各列（x 座標ごと）に白い画素がいくつあるか
-    proj = (bw > 0).astype(np.float32).sum(0)
-    # ギザギザをならすために平滑化。カーネル幅は桁幅の 60%（奇数にする必要があるので | 1）
-    k = max(3, int(step * 0.6)) | 1
+    # ---- 赤い桁の中心を先に決める ----
+    red_centers = []
+    if red_digits > 0 and win_color is not None:
+        m = red_mask(win_color)
+        proj_r = cv2.GaussianBlur((m > 0).astype(np.float32).sum(0)[None, :], (max(3, int(h * 0.3)) | 1, 1), 0)[0]
+        red_centers = _pick_peaks(proj_r, red_digits, min_dist=h * 0.4) or []
+    # 赤が見つからなければ、右端を赤い桁とみなす（フォールバック）
+    if len(red_centers) < red_digits:
+        step = w / n
+        red_centers = [w - (red_digits - i - 0.5) * step for i in range(red_digits)]
+
+    # ---- 黒い桁は赤い桁より左側だけで探す ----
+    x_limit = int(min(red_centers) - h * 0.3) if red_centers else w
+    sub = win[:, :max(1, x_limit)]
+    if sub.mean() > 127:                                    # 白地黒字の機種なら反転
+        sub = 255 - sub
+    _, bw = cv2.threshold(sub, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)   # Otsu 法で二値化
+    _, bw = crop_main_band(sub, bw)
+    step = sub.shape[1] / max(1, n_black)                   # 等分割したときの 1 桁の幅
+    proj = (bw > 0).astype(np.float32).sum(0)               # 列ごとの白い画素数
+    k = max(3, int(step * 0.6)) | 1                         # 平滑化の幅（奇数にする）
     sm = cv2.GaussianBlur(proj[None, :], (k, 1), 0)[0]
-    # 平滑化した投影から n 個のピーク（数字の中心）を探す
-    centers = _pick_peaks(sm, n, min_dist=step * 0.6)
-    if centers is None:                 # 見つからなければ等分割にフォールバック
-        centers = [(i + 0.5) * step for i in range(n)]
+    black_centers = _pick_peaks(sm, n_black, min_dist=step * 0.6)
+    if black_centers is None:                               # 見つからなければ等分割
+        black_centers = [(i + 0.5) * step for i in range(n_black)]
+    else:
+        # 「0」や「8」は中央がへこむのでピークが端に寄る。
+        # ピークを含む「白が連続する区間」の中点を数字の中心にし直す
+        black_centers = [_run_center(proj, c, thresh=h * 0.05, max_half=step * 0.5) for c in black_centers]
 
-    # セル幅 = 中心と中心の間隔の中央値（右端の赤い桁だけ広い機種などでもブレない）
-    cw = np.median(np.diff(centers)) if n > 1 else step
+    # ---- セル幅 = 黒い桁の中心間隔の中央値 ----
+    cw = np.median(np.diff(black_centers)) if n_black > 1 else h * DIGIT_ASPECT
 
-    cells = []
-    for c in centers:
-        a, b = int(round(c - cw / 2)), int(round(c + cw / 2))   # セルの左端・右端
-        # 画像からはみ出す分は端の画素を伸ばして埋める
-        pad_l, pad_r = max(0, -a), max(0, b - w)
-        cell = win[:, max(0, a):min(w, b)]
-        if pad_l or pad_r:
-            cell = cv2.copyMakeBorder(cell, 0, 0, pad_l, pad_r, cv2.BORDER_REPLICATE)
-        # CNN の入力サイズ 28×40 に縮小（INTER_AREA = 縮小向きの方式）
-        cells.append(cv2.resize(cell, (W, H), interpolation=cv2.INTER_AREA))
+    # ---- 赤い桁の中心を「白い箱」で補正 ----
+    # 赤マスクは色の薄い部分を取りこぼして中心が偏ることがある。
+    # 赤い桁は白い箱の中にあるので、赤の中心から左右に「明るい列」が続く範囲の中点を中心にする
+    bright = win.mean(0)                                    # 列ごとの平均明るさ
+    # しきい値は「暗い列（下位10%）と明るい列（上位10%）の中間」で自動的に決める
+    thr = (np.percentile(bright, 10) + np.percentile(bright, 90)) / 2
+    red_centers = [_run_center(bright, c, thresh=thr, max_half=cw * 0.6) for c in red_centers]
+
+    centers = list(black_centers) + list(red_centers)
+    cells = [_cut_cell(win, c, cw) for c in centers]
     return cells, win
+
+
+def _run_center(proj, c, thresh, max_half):
+    """
+    列投影 proj の位置 c から左右に「値が thresh より大きい間」広げて、
+    その区間（＝数字のインクがある範囲）の中点を返す。
+    広げる幅は片側 max_half まで（隣の数字につながってしまうのを防ぐ）。
+    """
+    w = len(proj)
+    a = b = int(round(c))
+    while a - 1 >= 0 and proj[a - 1] > thresh and c - (a - 1) <= max_half:
+        a -= 1
+    while b + 1 < w and proj[b + 1] > thresh and (b + 1) - c <= max_half:
+        b += 1
+    return (a + b) / 2
 
 
 def _pick_peaks(sig, n, min_dist):
@@ -302,8 +415,10 @@ def main():
     p, score = pick_counter_window(gray, boxes, a.digits)   # 2. 選択
     if p is None:
         print("数字窓が見つかりません"); return
-    win = rectify(gray, p)                             # 3. 正面化
-    cells, win_n = split_digits(win, a.digits)         # 4. 分割
+    p = extend_to_red_digits(img, p, a.red)            # 2'. 赤い小数桁が枠外なら右へ広げる
+    win = rectify(gray, p)                             # 3. 正面化（グレー）
+    win_color = rectify(img, p)                        #    同じ変換をカラーにも（赤い桁を探す用）
+    cells, win_n = split_digits(win, a.digits, win_color, a.red)   # 4. 分割
     labels, probs = classify(sess, cells)              # 5. 分類
     t2 = time.perf_counter()
 

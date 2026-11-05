@@ -53,9 +53,24 @@ def detect_boxes(ocr, img):
       use_rec=False : 文字認識（何と書いてあるか）は使わない。認識は自前の CNN でやる
     戻り値: [4×2 の配列, 4×2 の配列, ...]（領域ごとに 4 点 × (x, y)）
     """
-    res, _ = ocr(img, use_det=True, use_cls=False, use_rec=False)
-    # res は [[4点座標, 文字, 信頼度], ...]。座標部分 r[0] だけ取り出す。res が None なら空リスト
-    return [np.array(r[0], dtype=np.float32) for r in (res or [])]
+    out = ocr(img, use_det=True, use_cls=False, use_rec=False)
+    # 返り値はバージョンにより (結果, 経過時間) のタプルか、結果そのもの
+    res = out[0] if isinstance(out, tuple) else out
+    if res is None:
+        return []
+    boxes = []
+    for r in res:
+        a = np.array(r, dtype=object)
+        # 形式 A: [4点座標, 文字, 信頼度] → 先頭が座標
+        # 形式 B: 4点座標そのもの（検出のみのときにこの形で返すバージョンがある）
+        if a.ndim == 2 and a.shape == (4, 2):
+            box = a
+        else:
+            box = r[0]
+        box = np.array(box, dtype=np.float32).reshape(-1, 2)
+        if box.shape == (4, 2):
+            boxes.append(box)
+    return boxes
 
 
 # ======================================================

@@ -222,24 +222,27 @@ def crop_main_band(win, bw):
     return win[a:b], bw[a:b]
 
 
-def _cut_cell(win, c, cw):
-    """窓画像 win から中心 c・幅 cw のセルを切り出し、CNN の入力サイズに縮小する"""
+def _cut_cell(win, c, cw, invert=False):
+    """
+    窓画像 win から中心 c・幅 cw のセルを切り出し、CNN の入力サイズに縮小する。
+    invert=True なら白黒を反転する（白地に暗い文字 → 暗い背景に明るい文字 にそろえる）
+    """
     w = win.shape[1]
     a, b = int(round(c - cw / 2)), int(round(c + cw / 2))   # セルの左端・右端
     pad_l, pad_r = max(0, -a), max(0, b - w)                # 画像からはみ出す量
     cell = win[:, max(0, a):min(w, b)]
     if pad_l or pad_r:                                      # はみ出した分は端の画素を伸ばして埋める
         cell = cv2.copyMakeBorder(cell, 0, 0, pad_l, pad_r, cv2.BORDER_REPLICATE)
-    # 白地（赤い桁など）なら反転して黒地白字にそろえる。
-    # 端に隣の黒い窓が入り込むことがあるので、判定はセルの中央 50% で行う。
-    # 平均だと数字の色に引っ張られるので、中央値（＝面積の多い背景の色）を使う
-    cw_ = cell.shape[1]
-    if np.median(cell[:, cw_ // 4: cw_ - cw_ // 4]) > 127:
+    # ---- 白黒の向きをそろえる（常に「暗い背景に明るい数字」にする）----
+    # 画像の明るさから自動判定すると、反射で窓全体が明るいときや隣の窓の縁が入ったときに
+    # 誤判定しやすい。メーターの構造（黒い桁＝黒地白字、赤い桁＝白地赤字）は分かっているので、
+    # 呼び出し側が invert で指定する
+    if invert:
         cell = 255 - cell
     return cv2.resize(cell, (W, H), interpolation=cv2.INTER_AREA)   # INTER_AREA = 縮小向き
 
 
-def split_digits(win, n, win_color=None, red_digits=0):
+def split_digits(win, n, win_color=None, red_digits=0, invert_black=False):
     """
     正面化した窓画像 win を n 桁のセルに分割する。
 
@@ -293,8 +296,9 @@ def split_digits(win, n, win_color=None, red_digits=0):
     thr = (np.percentile(bright, 10) + np.percentile(bright, 90)) / 2
     red_centers = [_run_center(bright, c, thresh=thr, max_half=cw * 0.6) for c in red_centers]
 
-    centers = list(black_centers) + list(red_centers)
-    cells = [_cut_cell(win, c, cw) for c in centers]
+    # 黒い桁は黒地白字（invert_black=True の機種なら反転）、赤い桁は白地なので常に反転
+    cells = [_cut_cell(win, c, cw, invert=invert_black) for c in black_centers]
+    cells += [_cut_cell(win, c, cw, invert=True) for c in red_centers]
     return cells, win
 
 
@@ -336,12 +340,14 @@ def _pick_peaks(sig, n, min_dist):
 # ======================================================
 # 5. 分類 — 各セルの数字を CNN で判定
 # ======================================================
-def classify(sess, cells, tta=True):
+def classify(sess, cells, tta=True, both_polarity=True):
     """
     セル画像を CNN に入れて、各セルの (予測ラベル, 信頼度) を返す。
 
     tta=True のときは画像を上下左右 2 ピクセルずらした 4 パターンも推論して平均する
     （TTA = Test Time Augmentation。少しのズレに強くなる。追加コストは数 ms）
+    both_polarity=True のときは白黒反転した画像でも推論して平均する
+    （モデルは両方の向きで学習しているが完全には同じ答えにならないので、平均してブレを減らす）
     """
     # (枚数, 高さ, 幅) → (枚数, 1, 高さ, 幅)、0〜255 → 0〜1
     x = np.stack(cells).astype(np.float32)[:, None] / 255.0
@@ -349,6 +355,8 @@ def classify(sess, cells, tta=True):
     if tta:
         for dx, dy in ((2, 0), (-2, 0), (0, 2), (0, -2)):
             views.append(np.roll(x, (dy, dx), axis=(2, 3)))   # 画像をずらしたコピー
+    if both_polarity:
+        views += [1 - v for v in views]                        # 全パターンの白黒反転版
 
     probs = []
     for v in views:
@@ -400,6 +408,7 @@ def main():
     ap.add_argument("image")                                                   # 画像ファイル
     ap.add_argument("--digits", type=int, default=8, help="数字窓の桁数")
     ap.add_argument("--red", type=int, default=3, help="小数桁（赤字）の数")
+    ap.add_argument("--invert", action="store_true", help="黒い桁が白地に黒文字の機種なら指定")
     ap.add_argument("--debug", action="store_true")                            # 付けると True
     a = ap.parse_args()
 
@@ -418,7 +427,7 @@ def main():
     p = extend_to_red_digits(img, p, a.red)            # 2'. 赤い小数桁が枠外なら右へ広げる
     win = rectify(gray, p)                             # 3. 正面化（グレー）
     win_color = rectify(img, p)                        #    同じ変換をカラーにも（赤い桁を探す用）
-    cells, win_n = split_digits(win, a.digits, win_color, a.red)   # 4. 分割
+    cells, win_n = split_digits(win, a.digits, win_color, a.red, a.invert)   # 4. 分割
     labels, probs = classify(sess, cells)              # 5. 分類
     t2 = time.perf_counter()
 

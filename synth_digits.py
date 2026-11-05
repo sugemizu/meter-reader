@@ -131,6 +131,25 @@ def draw_straight_6(dr, cx, cy, h, fg, width, flip=False):
                 fill=fg, width=width)
 
 
+# ================== 「上が開いた4」を手描きする ==================
+OPEN4_RATE = 0.5           # 上が開いた 4 を使う確率
+
+def draw_open_4(dr, cx, cy, h, fg, width):
+    """
+    上が閉じていない「4」: 右寄りの縦線 ＋ その上端から左下へ降りる斜線 ＋ 横棒
+    （PC フォントの 4 は斜線と縦線が上で接して三角形を作るものが多い）
+    """
+    w = h * 0.6
+    x0, x1 = cx - w / 2, cx + w / 2
+    yt, yb = cy - h / 2, cy + h / 2
+    xs = x0 + w * random.uniform(0.62, 0.75)       # 縦線の x
+    ybar = yt + h * random.uniform(0.6, 0.72)      # 横棒の y
+    gap = width * random.uniform(0.0, 0.8)         # 斜線と縦線の上端のすき間
+    dr.line([(xs, yt), (xs, yb)], fill=fg, width=width)                      # 縦線
+    dr.line([(xs - gap, yt + gap * 0.5), (x0 + width / 2, ybar)], fill=fg, width=width)   # 斜線
+    dr.line([(x0, ybar), (x1, ybar)], fill=fg, width=width)                  # 横棒
+
+
 # ================== ドラム帯を描く ==================
 def drum_strip(d, font, size, fg, bg, stroke, cw):
     """
@@ -152,6 +171,7 @@ def drum_strip(d, font, size, fg, bg, stroke, cw):
     f = ImageFont.truetype(font, size)           # フォントを読み込む
     use_flat3 = random.random() < FLAT3_RATE     # この帯では平らな 3 を使うか？
     use_s69 = random.random() < STRAIGHT69_RATE  # この帯では直線の 6/9 を使うか？
+    use_open4 = random.random() < OPEN4_RATE     # この帯では上が開いた 4 を使うか？
 
     # フォントごとに文字の実際の高さが違うので、「0」の高さを基準にそろえる
     b0 = dr.textbbox((0, 0), "0", font=f, stroke_width=stroke)   # 0 を描いたときの枠
@@ -170,6 +190,9 @@ def drum_strip(d, font, size, fg, bg, stroke, cw):
         if s in ("6", "9") and use_s69:
             # 6 と 9 も特別扱い: 直線的な 6（9 は上下反転）
             draw_straight_6(dr, cx, cy, glyph_h, fg, max(5, int(glyph_h * 0.17) + stroke), flip=(s == "9"))
+            continue
+        if s == "4" and use_open4:
+            draw_open_4(dr, cx, cy, glyph_h, fg, max(5, int(glyph_h * 0.17) + stroke))
             continue
 
         # 通常の数字: フォントで描く
@@ -284,6 +307,16 @@ def augment(img):
         cx = random.choice([random.randint(0, r), random.randint(w - r, w)])  # 左端 or 右端
         cy = random.randint(int(h * 0.55), h)                                 # 下寄り
         dr.ellipse((cx - r, cy - r, cx + r, cy + r), fill=random.randint(150, 255))   # 明るい丸
+
+    # 数字を囲む箱の枠線（赤い小数桁は四角い枠の中にあることが多い）: 30% の確率
+    if random.random() < 0.3:
+        dr = ImageDraw.Draw(img)
+        w, h = img.size
+        t = random.randint(2, max(3, w // 9))                 # 枠線の太さ
+        ins_x = random.randint(0, w // 6)                      # 左右の内側への寄り
+        ins_y = random.randint(-h // 8, h // 6)                # 上下（マイナスなら画像外＝線が見えない）
+        col = random.choice([random.randint(0, 60), random.randint(170, 255)])   # 暗い線 or 明るい線
+        dr.rectangle((ins_x, ins_y, w - 1 - ins_x, h - 1 - ins_y), outline=col, width=t)
 
     # 窓枠の縁が映り込む: 30% の確率
     if random.random() < 0.3:

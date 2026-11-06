@@ -29,7 +29,7 @@ synth_red_digits.py — 赤い小数桁専用の「合成画像」を作るス�
   python synth_red_digits.py --out data/synth_red_test --n 200 --seed 12345   # 評価用
 """
 
-import os, sys, csv, random, argparse, math
+import os, csv, random, argparse, math
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw, ImageFilter
@@ -153,15 +153,16 @@ def draw_square_digit(dr, d, cx, cy, h, fg, rng=random, width_ratio=None, stroke
         dr.line(_round_path(pts, r, st), fill=fg, width=t, joint="curve")
 
 
-
-
 # ================== 帯・窓・カラー合成 ==================
 def red_strip(d, cw):
     """
     d-2..d+2 を縦に並べたインクのマスク帯（L, インク=255）を作る。
     返り値: (帯, 中央の数字の中心 y, 字の高さ, 書体 "square" か "font")
     """
-    size = int(PITCH * random.uniform(0.72, 0.92))        # 字の高さ / ピッチ。meter4 実測 ≈ 0.82（黒桁の 0.62〜0.95 より詰まっている）
+    # 角型の字高 / ピッチ。meter4 実測 ≈ 0.82（黒桁の 0.62〜0.95 より詰まっている）。
+    # フォント字形にも同じ size を渡すが、これはフォントサイズなので実際の字高は約 0.7 倍になり、角型より一回り小さい。
+    # 学習済みモデルがこの分布で作られているので生成は変えない（現物が角型でない場合の保険として、小さめも許容）
+    size = int(PITCH * random.uniform(0.72, 0.92))
     if random.random() < FONT_GLYPH_RATE:
         font = random.choice(sd.FONTS)
         # 赤桁は細いので太らせない（stroke 0〜2）。平らな 3・直線の 6/9・開いた 4 も drum_strip の中で混ざる

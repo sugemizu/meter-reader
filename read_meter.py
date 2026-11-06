@@ -46,7 +46,12 @@ def get_red_session():
     global _RED_SESS
     if _RED_SESS is None:
         if os.path.exists(RED_MODEL_PATH):
-            _RED_SESS = ort.InferenceSession(RED_MODEL_PATH, providers=["CPUExecutionProvider"])
+            try:
+                _RED_SESS = ort.InferenceSession(RED_MODEL_PATH, providers=["CPUExecutionProvider"])
+            except Exception as e:
+                # ファイルが壊れていても全体を止めず、無いときと同じ扱い（警告を 1 回だけ出して従来経路）にする
+                print(f"warning: digit_cnn_red.onnx を読めないので赤い桁も黒桁のモデルで読みます ({e})", file=sys.stderr)
+                _RED_SESS = False
         else:
             print("warning: digit_cnn_red.onnx が無いので赤い桁も黒桁のモデルで読みます", file=sys.stderr)
             _RED_SESS = False
@@ -642,9 +647,11 @@ def classify_cells(sess, cells, red_digits=0, red_color_cells=None, dbg=None):
     inputs, info = [], []
     for k in range(red_digits):
         x = None
-        rng = red_score_range(red_color_cells[k])[0]
-        if red_sess is not None and rng >= RED_EMPTY:
-            x = red_cell_input(red_color_cells[k])
+        # カラーのセルが無い（win_color=None 経由など）と赤みの幅は測れないので、従来経路（黒モデル）に回す
+        cc = red_color_cells[k] if red_color_cells and k < len(red_color_cells) else None
+        rng = red_score_range(cc)[0] if cc is not None else None
+        if red_sess is not None and rng is not None and rng >= RED_EMPTY:
+            x = red_cell_input(cc)
             l, p = classify(red_sess, [x], tta=True, both_polarity=False)
             info.append((rng, "red"))
         else:
@@ -865,7 +872,7 @@ def main():
         m, st = red_mask(res["win_color"], return_stats=True)
         cv2.imwrite("debug_redmask.png", np.vstack([res["win_color"], cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)]))
         if rd and rd["red_info"]:
-            print("red_input: " + " ".join(f"range={r:.0f} model={m}" for r, m in rd["red_info"]))
+            print("red_input: " + " ".join((f"range={r:.0f} model={m}" if r is not None else f"range=- model={m}") for r, m in rd["red_info"]))
         print("refine: " + (f"ok rows=({rows[0]},{rows[1]})" if rows else "fallback"))
         if a.red > 0:
             if res["red_fallback"]:

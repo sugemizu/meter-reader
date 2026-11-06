@@ -40,7 +40,10 @@ from PIL import Image
 # ================== 設定値 ==================
 DATA = os.environ.get("DATA", "data/synth")          # 合成画像のフォルダ（赤桁用は data/synth_red）
 OUT = os.environ.get("OUT", "digit_cnn.onnx")        # 書き出す ONNX（赤桁用は digit_cnn_red.onnx。黒桁モデルを上書きしないこと）
-FLIP = os.environ.get("FLIP", "1") == "1"            # 明暗反転の augmentation（赤みチャネルは極性が一定なので赤桁用は 0）
+FLIP = os.environ.get("FLIP", "1").lower() not in ("0", "false", "no")   # 明暗反転の augmentation（赤みチャネルは極性が一定なので赤桁用は 0）
+# 赤桁用データで黒桁モデル（コミット済みの digit_cnn.onnx）を上書きする事故を防ぐ
+if DATA != "data/synth" and OUT == "digit_cnn.onnx":
+    raise SystemExit("DATA が既定 (data/synth) 以外なのに OUT が既定の digit_cnn.onnx のままです。黒桁モデルを上書きしないよう OUT を指定してください")
 W, H = 28, 40                                        # 画像サイズ（synth_digits.py と同じ値）
 EPOCHS = int(os.environ.get("EPOCHS", 12))           # 環境変数 EPOCHS があればそれを使う。無ければ 12
 
@@ -82,7 +85,7 @@ class DigitNet(nn.Module):
 # ================== データ読み込み ==================
 def load():
     """
-    data/synth/<ラベル>/*.png を全部読み込んで、
+    DATA（既定 data/synth）/<ラベル>/*.png を全部読み込んで、
     (学習用 90%, 検証用 10%) に分けて返す。
     """
     xs, ys = [], []    # xs: 画像の配列, ys: ラベル（正解）

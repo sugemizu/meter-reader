@@ -151,14 +151,16 @@ def pick_counter_window(gray, boxes, expect_digits):
 RED_HUE_LO, RED_HUE_HI = 12, 165   # 赤の色相範囲（OpenCV の H は 0〜180）。従来の 10/170 より少し広い（露出・ガンマで色相が動くため）
 
 
-def red_mask(img, roi_mask=None, return_stats=False):
+def red_mask(img, roi_mask=None, return_stats=False, min_diff=15):
     """
     カラー画像から「赤い画素」だけを白にしたマスクを返す。
     しきい値は画像（roi_mask があればその内側）の中で相対的に決める:
       score = R - max(G, B)（0〜255）
       noise = score の 90 パーセンタイル（ほとんどの画素は赤くないので、これが雑音の水準）
       peak  = score の 99.5 パーセンタイル（赤い桁の画素はおおむね 0.5% 以上ある）
-      peak < max(10, 3*noise + 4) なら「赤は無い」として空のマスク（赤の無い窓で雑音を拾わないための下限）
+      peak - noise < min_diff（既定 15）なら「赤は無い」として空のマスク（赤の無い窓で雑音を拾わないための下限）。
+      以前は peak < 3*noise + 4 だったが、探索範囲に文字盤が入ると noise 自体が高く（素の meter4 で 17）、
+      暖色かぶり +10 で赤なしと誤判定したので、倍率でなく差で見る（赤い桁の peak - noise は素で 50、かぶり +10〜+20 でも 55 前後）
       thr = noise + 0.4*(peak - noise)、 mask = (score > thr) & 色相が赤
     HSV の彩度・明度の絶対しきい値（S>100, V>80）は、低コントラスト・ぼけ・露出不足で赤が全部消えたので廃止。
     Otsu も試したが、赤が数 % しかなくヒストグラムが片寄り、しきい値が雑音のすぐ上に張り付いたので不採用。
@@ -166,15 +168,15 @@ def red_mask(img, roi_mask=None, return_stats=False):
     """
     b, g, r = [img[..., i].astype(np.int16) for i in range(3)]
     score = np.clip(r - np.maximum(g, b), 0, 255).astype(np.uint8)
-    hue = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[..., 0]
     vals = score[roi_mask > 0] if roi_mask is not None else score.ravel()
     empty = np.zeros(score.shape, np.uint8)
     if vals.size == 0:
         return (empty, dict(thr=None, peak=0.0, noise=0.0)) if return_stats else empty
     noise = float(np.percentile(vals, 90))
     peak = float(np.percentile(vals, 99.5))
-    if peak < max(10, 3 * noise + 4):
+    if peak - noise < min_diff:
         return (empty, dict(thr=None, peak=peak, noise=noise)) if return_stats else empty
+    hue = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[..., 0]       # 赤なしの早期 return では不要なのでここで変換
     thr = noise + 0.4 * (peak - noise)       # 0.4: 赤セルの値と雑音の間の雑音寄り。0.5 だと低コントラストで細い線が切れる
     m = ((score > thr) & ((hue <= RED_HUE_LO) | (hue >= RED_HUE_HI))).astype(np.uint8) * 255
     if roi_mask is not None:
@@ -199,16 +201,18 @@ def extend_to_red_digits(img, p, red_digits):
     if red_digits <= 0:
         return p
     unit, vpad, reach = 64, 0.2, 3.0                           # 窓の高さを 64 行にして、上下 0.2h・右へ 3h を見る
-    v = ((p[3] - p[0]) + (p[2] - p[1])) / 2
-    h = float(np.linalg.norm(v))
+    vl, vr = p[3] - p[0], p[2] - p[1]                          # 左辺・右辺の「下向き」ベクトル
+    h = float(np.linalg.norm(vl + vr)) / 2
     top_dir = (p[1] - p[0]) / np.linalg.norm(p[1] - p[0])
     bot_dir = (p[2] - p[3]) / np.linalg.norm(p[2] - p[3])
     # 探索枠: 右辺を各辺の向きに 3h 伸ばし、上下を 0.2h ずつ広げる
     big = p.copy()
     big[1] = p[1] + top_dir * reach * h
     big[2] = p[2] + bot_dir * reach * h
-    big[:2] -= vpad * v
-    big[2:] += vpad * v
+    big[0] -= vpad * vl                                        # 上下は左右それぞれの辺のベクトルで広げる（台形の枠で辺がずれない）
+    big[1] -= vpad * vr
+    big[2] += vpad * vr
+    big[3] += vpad * vl
     sh = int(round(unit * (1 + 2 * vpad)))
     M, ow = _quad_homography(big, sh)
     wc = cv2.warpPerspective(img, M, (ow, sh))
@@ -217,16 +221,29 @@ def extend_to_red_digits(img, p, red_digits):
 
     m = red_mask(wc)                                           # 探索枠の全体が範囲なので roi_mask は不要
     n, _, stats, cent = cv2.connectedComponentsWithStats(m)    # 赤い塊ごとに位置・大きさを取得
-    far_x = None
     amin = max(15, 0.002 * unit * unit)                        # 小さすぎるノイズは無視
+    blobs = []
     for i in range(1, n):                                      # 0 番は背景なので飛ばす
         x, y, w_, h_, area = stats[i]
         cx, cy = cent[i]
         if area < amin:
             continue
+        # 帯を縦に横切る赤い針は、探索範囲の上下端に届くか、数字より背が高い。
+        # 重心だけで判定すると針の重心が帯の中に入って拡張が針まで伸びるので、こうした塊は捨てる
+        if y == 0 or y + h_ >= sh or h_ > 1.2 * unit:
+            continue
+        blobs.append((cx, x + w_, area))
+    # 赤なし判定を差で見るようにして雑音に寛容になったぶん、探索範囲で最大の塊の 1/10 未満の小さな塊
+    # （窓の右の文字盤の微小な赤み。面積 15〜17 で拡張を 2 倍近くに伸ばした例があった）は雑音として捨てる。
+    # 最大の塊は窓の中の赤い桁のこともあるので、位置で絞る前の全部から求める
+    amax = max((a for _, _, a in blobs), default=0)
+    far_x = None
+    for cx, right, area in blobs:
+        if area < 0.1 * amax:
+            continue
         if not (x_right - unit * 0.3 <= cx <= x_right + unit * reach):   # 窓の右隣か
             continue
-        far_x = x + w_ if far_x is None else max(far_x, x + w_)   # 一番右の赤の右端
+        far_x = right if far_x is None else max(far_x, right)               # 一番右の赤の右端
 
     if far_x is None:
         return p                                               # 赤が見つからなければそのまま
@@ -284,10 +301,12 @@ def refine_vertical(gray, p, n, red_digits, invert_black=False,
     dbg: dict を渡すと --debug 用に正面化画像・行プロファイル・各境界の行を書き込む
     戻り値: (新しい 4 点 float32, (a, b) 帯の上端・下端の行)  または失敗時 (p, None)
     """
-    v = ((p[3] - p[0]) + (p[2] - p[1])) / 2                  # 窓の「下向き」ベクトル（高さ方向）
+    vl, vr = p[3] - p[0], p[2] - p[1]                        # 左辺・右辺の「下向き」ベクトル（台形の枠で辺がずれないよう別々に広げる）
     big = p.copy()
-    big[:2] -= expand * v                                    # 上下を高さの expand 倍ずつ広げた枠
-    big[2:] += expand * v
+    big[0] -= expand * vl                                    # 上下を高さの expand 倍ずつ広げた枠
+    big[1] -= expand * vr
+    big[2] += expand * vr
+    big[3] += expand * vl
     sh = int(round(unit * (1 + 2 * expand)))
     M, ow = _quad_homography(big, sh)
     w = cv2.warpPerspective(gray, M, (ow, sh))
@@ -302,7 +321,8 @@ def refine_vertical(gray, p, n, red_digits, invert_black=False,
     prof = cv2.GaussianBlur(prof[:, None], (1, 3), 0)[:, 0]  # 縦 3 タップ。強くすると縁の隙間が埋まる
     c0, c1 = y0 + unit // 4, y1 - unit // 4                  # 元の窓の中央半分から種を選ぶ
     seed = c0 + int(np.argmax(prof[c0:c1]))
-    thr = max(0.01, rel * prof[c0:c1].max())                 # 帯の中のくぼみ（最大の 12〜15%）は通し、縁の 0 で止める
+    thr = max(0.01, rel * prof[c0:c1].max())  # 帯の中のくぼみ（最大の 12〜15%）は通し、縁の 0 で止める。
+    # 下限 0.01 は max が 0 に近い（インクがほぼ無い）ときも thr > 0 を保ち、インク 0 の行で必ず止めるため
     lo, hi = max(0, y0 - unit // 4), min(sh, y1 + unit // 4)   # 広げる範囲は元の窓の上下 1/4 まで
     a = b = seed
     while a - 1 >= lo and thr < prof[a - 1] < face:
@@ -357,6 +377,11 @@ def _cut_cell(win, c, cw, invert=False):
     a, b = int(round(c - cw / 2)), int(round(c + cw / 2))   # セルの左端・右端
     if b <= a:                                              # 幅 0 だと空セルになり cv2.resize が落ちるので最低 1 画素にする
         b = a + 1
+    # 窓の外に完全にはみ出すと切り出しが空配列になり、copyMakeBorder が不定の値を返す
+    # （ピッチ外挿のセルが窓の右にはみ出すと隣のメモリの値が混ざった）。左端を窓内に収めて端の 1 列から複製させる
+    a = min(a, w - 1)
+    b = max(b, a + 1, 1)
+    a = min(a, b - 1)
     pad_l, pad_r = max(0, -a), max(0, b - w)                # 画像からはみ出す量
     cell = win[:, max(0, a):min(w, b)]
     if pad_l or pad_r:                                      # はみ出した分は端の画素を伸ばして埋める
@@ -393,7 +418,7 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False,
     # ---- 赤い桁の中心を先に決める ----
     red_centers = []
     if red_digits > 0 and win_color is not None:
-        m = red_mask(win_color)
+        m = red_mask(win_color, min_diff=10)             # 窓の中だけを見るので雑音が少なく、低コントラストの赤い桁（peak 12 程度）も拾う
         proj_r = cv2.GaussianBlur((m > 0).astype(np.float32).sum(0)[None, :], (max(3, int(h * 0.3)) | 1, 1), 0)[0]
         # 赤い桁は黒い桁より右側にあるはず。天地逆の写真や窓の左に赤い線・枠があると、
         # 左の赤を赤い桁と誤認して黒い桁の領域が潰れ、空セルになって落ちていたので、
@@ -409,7 +434,13 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False,
         # x_limit は等分割の境界から半セル右まで（枠が黒桁だけでも最後の黒桁の中心は入り、
         # 「▶」まで含んでも赤い箱の中心までは届かない）
         x_limit = int(w * (n_black + 0.5) / n)
-        black_centers, _ = _black_centers(win, x_limit, n_black, h)
+        # 赤が検出できなくても白い箱が枠に含まれることがある（赤だけ色が薄い・箱の中が空など）。
+        # 箱の左半分の明るい列を黒桁のピークとして拾うと黒桁が 1 桁ずれる（meter4 の赤桁を白で塗ると 0411.5）ので、
+        # 右側の明るい連続区間（白い箱）を探し、その左端の少し手前で打ち切る
+        box_left = _white_box_left(win, n_black, n, h)
+        if box_left is not None:
+            x_limit = min(x_limit, int(box_left - 0.1 * h))
+        black_centers = _black_centers(win, x_limit, n_black, h)
         pitch = np.median(np.diff(black_centers)) if n_black > 1 else h * DIGIT_ASPECT
         red_centers = [black_centers[-1] + pitch * (i + 1) for i in range(red_digits)]
     else:
@@ -417,7 +448,7 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False,
         x_limit = int(min(red_centers) - h * 0.3) if red_centers else w
         # 万一赤の位置が左に寄っても黒い桁の領域が潰れないよう、等分割の半分は確保する（保険）
         x_limit = max(x_limit, int(w * n_black / n * 0.5))
-        black_centers, _ = _black_centers(win, x_limit, n_black, h)
+        black_centers = _black_centers(win, x_limit, n_black, h)
 
     # ---- セル幅 = 黒い桁の中心間隔の中央値 ----
     cw = np.median(np.diff(black_centers)) if n_black > 1 else h * DIGIT_ASPECT
@@ -445,10 +476,37 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False,
     return cells, win
 
 
+def _white_box_left(win, n_black, n, h):
+    """
+    窓の右側にある「明るい列が続く区間」（赤い桁の白い箱）の左端の x を返す。無ければ None。
+    列の平均明るさを「暗い列（下位 10%）と明るい列（上位 10%）の中間」で二値化し、右から見て
+    幅 h*0.4 以上の最初の区間を箱とみなす（黒桁の白い線は幅が狭く、列平均もしきい値に届かない）。
+    箱は黒い桁の領域より右にあるはずなので、黒い桁の領域の境界から h*0.8 手前より左で始まる区間は
+    箱ではなく黒桁の一部とみなして無視する（赤の探索と同じ余白）
+    """
+    w = win.shape[1]
+    bright = win.mean(0)
+    thr = (np.percentile(bright, 10) + np.percentile(bright, 90)) / 2
+    on = bright >= thr
+    lowest = w * n_black / n - h * 0.8
+    i = w - 1
+    while i >= 0:
+        if not on[i]:
+            i -= 1
+            continue
+        j = i
+        while j - 1 >= 0 and on[j - 1]:
+            j -= 1
+        if i - j + 1 >= h * 0.4 and j >= lowest:
+            return float(j)
+        i = j - 1
+    return None
+
+
 def _black_centers(win, x_limit, n_black, h):
     """
     win[:, :x_limit] で黒い桁の中心を n_black 個探す（列投影のピーク → 白が連続する区間の中点）。
-    戻り値: (中心のリスト, ピークが取れたか)。取れなければ等分割の中心
+    戻り値: 中心のリスト。ピークが取れなければ等分割の中心
     """
     sub = win[:, :max(1, x_limit)]
     if sub.mean() > 127:                                    # 白地黒字の機種なら反転
@@ -461,10 +519,10 @@ def _black_centers(win, x_limit, n_black, h):
     sm = cv2.GaussianBlur(proj[None, :], (k, 1), 0)[0]
     peaks = _pick_peaks(sm, n_black, min_dist=step * 0.6)
     if peaks is None:                                       # 見つからなければ等分割
-        return [(i + 0.5) * step for i in range(n_black)], False
+        return [(i + 0.5) * step for i in range(n_black)]
     # 「0」や「8」は中央がへこむのでピークが端に寄る。
     # ピークを含む「白が連続する区間」の中点を数字の中心にし直す
-    return [_run_center(proj, c, thresh=h * 0.05, max_half=step * 0.5) for c in peaks], True
+    return [_run_center(proj, c, thresh=h * 0.05, max_half=step * 0.5) for c in peaks]
 
 
 def _run_center(proj, c, thresh, max_half):
@@ -609,12 +667,12 @@ def locate_and_read(img, gray, boxes, n, red_digits, invert_black, sess, debug=N
     戻り値は dict（数字窓が無ければ None）:
       labels, probs, score, rot, refined, red_fallback,
       p_pick（選択直後）, p_ext（向き補正＋赤拡張後・精緻化前）, p_win（最終の枠）,
-      win, win_color, cells, centers（黒＋赤のセル中心。win の x 座標）, cand（両候補の conf_black と rs）
+      win, win_color, cells, centers（黒＋赤のセル中心。win の x 座標）, cand（両候補の conf_black と rs。例外で落ちた候補は rot と err のみ）
     """
     p, score = pick_counter_window(gray, boxes, n)       # 2. 選択（縦長は回してある）
     if p is None:
         return None
-    results, last_err = [], None
+    results, errs, last_err = [], [], None
     for k, c in enumerate([p, np.roll(p, 2, axis=0)]):   # 0° と 180°（点の並びを 2 つ回す）
         try:
             e = extend_to_red_digits(img, c, red_digits)     # 2'. 赤い小数桁が枠外なら右へ広げる
@@ -626,7 +684,11 @@ def locate_and_read(img, gray, boxes, n, red_digits, invert_black, sess, debug=N
             cells, _ = split_digits(win, n, win_color, red_digits, invert_black, win_red=win_red, info=info)
             labels, probs = classify(sess, cells)
             rs = red_side_score(img, e, n) if red_digits > 0 else 0.0
-        except Exception as ex:          # 候補ごとの失敗は捨てる（両方失敗したら最後の例外を投げ直す）
+        except (cv2.error, ValueError, IndexError, ZeroDivisionError) as ex:
+            # 窓が壊れる・空配列になるなど「その向きでは読めない」失敗だけを候補から外す。
+            # それ以外（バグ）まで握りつぶすと、0° だけ例外で落ちたときに 180° が黙って採用される。
+            # 失敗した候補も cand に err として残し、main が表示する
+            errs.append(dict(rot=180 * k, err=f"{type(ex).__name__}: {ex}"))
             last_err = ex
             continue
         results.append(dict(labels=labels, probs=probs, score=score, rot=180 * k, refined=rows is not None,
@@ -644,7 +706,7 @@ def locate_and_read(img, gray, boxes, n, red_digits, invert_black, sess, debug=N
         elif b["conf_black"] > a["conf_black"] + 0.2:
             best = b
     best = dict(best)
-    best["cand"] = [dict(rot=r["rot"], conf_black=r["conf_black"], rs=r["rs"]) for r in results]
+    best["cand"] = [dict(rot=r["rot"], conf_black=r["conf_black"], rs=r["rs"]) for r in results] + errs
     return best
 
 
@@ -692,6 +754,9 @@ def main():
     reading, conf, rolling = to_reading(labels, probs, a.red)
     print(f"reading: {reading}  min_conf: {conf:.2f}  window_score: {score:.2f}  rolling: {rolling}")
     print(f"window: rot={res['rot']} refined={res['refined']} red_fallback={res['red_fallback']}")
+    for c in res["cand"]:
+        if "err" in c:                                  # 片方の向きが例外で落ちたことを黙って流さない
+            print(f"warning: rot={c['rot']} の候補が失敗しました: {c['err']}")
     print(f"detect {1000*(t1-t0):.0f} ms / rest {1000*(t2-t1):.0f} ms")
     print("per-digit:", [(int(l), round(float(c), 2)) for l, c in zip(labels, probs)])
 
@@ -741,7 +806,7 @@ def main():
                 print(f"red: thr={thr} peak={st['peak']:.1f} noise={st['noise']:.1f} "
                       f"found={[round(c) for c in res['centers'][a.digits - a.red:]]}")
         c = {r["rot"]: r for r in res["cand"]}
-        f = lambda r, k: "-" if r not in c else f"{c[r][k]:.2f}"
+        f = lambda r, k: "-" if r not in c or "err" in c[r] else f"{c[r][k]:.2f}"
         print(f"orient: rot={res['rot']} conf0={f(0, 'conf_black')} conf180={f(180, 'conf_black')} "
               f"red0={f(0, 'rs')} red180={f(180, 'rs')}")
         print("debug_*.{jpg,png} を出力しました")

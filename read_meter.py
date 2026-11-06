@@ -22,11 +22,13 @@ read_meter.py — 水道メーターの写真から数値を読み取る（本�
   rapidocr       : PP-OCR の検出モデルを同梱した軽量 OCR パッケージ
 """
 
-import sys, time, argparse
+import os, sys, time, argparse
 import numpy as np
 import cv2
 import onnxruntime as ort
 
+# モデルはスクリプトの場所基準で読む（別ディレクトリから実行しても見つかるように）
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "digit_cnn.onnx")
 W, H = 28, 40    # CNN に入れる 1 桁画像のサイズ（学習時と同じ）
 
 
@@ -244,6 +246,8 @@ def _cut_cell(win, c, cw, invert=False):
     """
     w = win.shape[1]
     a, b = int(round(c - cw / 2)), int(round(c + cw / 2))   # セルの左端・右端
+    if b <= a:                                              # 幅 0 だと空セルになり cv2.resize が落ちるので最低 1 画素にする
+        b = a + 1
     pad_l, pad_r = max(0, -a), max(0, b - w)                # 画像からはみ出す量
     cell = win[:, max(0, a):min(w, b)]
     if pad_l or pad_r:                                      # はみ出した分は端の画素を伸ばして埋める
@@ -275,6 +279,10 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False):
     if red_digits > 0 and win_color is not None:
         m = red_mask(win_color)
         proj_r = cv2.GaussianBlur((m > 0).astype(np.float32).sum(0)[None, :], (max(3, int(h * 0.3)) | 1, 1), 0)[0]
+        # 赤い桁は黒い桁より右側にあるはず。天地逆の写真や窓の左に赤い線・枠があると、
+        # 左の赤を赤い桁と誤認して黒い桁の領域が潰れ、空セルになって落ちていたので、
+        # 黒い桁の領域（の手前）より左の赤は無視して、赤の探索を窓の右側に限定する
+        proj_r[:max(0, int(w * n_black / n - h * 0.3))] = 0
         red_centers = _pick_peaks(proj_r, red_digits, min_dist=h * 0.4) or []
     # 赤が見つからなければ、右端を赤い桁とみなす（フォールバック）
     if len(red_centers) < red_digits:
@@ -283,6 +291,8 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False):
 
     # ---- 黒い桁は赤い桁より左側だけで探す ----
     x_limit = int(min(red_centers) - h * 0.3) if red_centers else w
+    # 万一赤の位置が左に寄っても黒い桁の領域が潰れないよう、等分割の半分は確保する（保険）
+    x_limit = max(x_limit, int(w * n_black / n * 0.5))
     sub = win[:, :max(1, x_limit)]
     if sub.mean() > 127:                                    # 白地黒字の機種なら反転
         sub = 255 - sub
@@ -302,6 +312,7 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False):
 
     # ---- セル幅 = 黒い桁の中心間隔の中央値 ----
     cw = np.median(np.diff(black_centers)) if n_black > 1 else h * DIGIT_ASPECT
+    cw = max(cw, 2.0)                                       # 幅が 1 画素未満だと空セルになるので下限を付ける（保険）
 
     # ---- 赤い桁の中心を「白い箱」で補正 ----
     # 赤マスクは色の薄い部分を取りこぼして中心が偏ることがある。
@@ -337,6 +348,8 @@ def _pick_peaks(sig, n, min_dist):
     信号 sig から、高い順に n 個のピークを選ぶ。ただし互いに min_dist 以上離れていること。
     戻り値: 左から順に並べたピーク位置。n 個取れなければ None
     """
+    if n <= 0:                          # 0 個以下を求められたら何も選ばない
+        return []
     idx = np.argsort(-sig)              # 値が大きい順の添字（-sig で降順）
     chosen = []
     for i in idx:
@@ -364,6 +377,8 @@ def classify(sess, cells, tta=True, both_polarity=True):
     both_polarity=True のときは白黒反転した画像でも推論して平均する
     （モデルは両方の向きで学習しているが完全には同じ答えにならないので、平均してブレを減らす）
     """
+    if len(cells) == 0:
+        raise ValueError("セルが切り出せませんでした")
     # (枚数, 高さ, 幅) → (枚数, 1, 高さ, 幅)、0〜255 → 0〜1
     x = np.stack(cells).astype(np.float32)[:, None] / 255.0
     views = [x]
@@ -426,11 +441,23 @@ def main():
     ap.add_argument("--invert", action="store_true", help="黒い桁が白地に黒文字の機種なら指定")
     ap.add_argument("--debug", action="store_true")                            # 付けると True
     a = ap.parse_args()
+    if a.digits < 1:
+        ap.error("--digits は 1 以上にしてください")
+    if not 0 <= a.red < a.digits:                      # 赤い桁は 0 以上、全桁数より少なくする
+        ap.error("--red は 0 以上 --digits 未満にしてください")
 
-    img = cv2.imread(a.image)                          # 画像を読み込む（カラー）
+    # cv2.imread は Windows で日本語などの非 ASCII パスを読めないので、
+    # バイト列として読んでから imdecode する。読めなければ明示的なメッセージで終了する
+    try:
+        img = cv2.imdecode(np.fromfile(a.image, np.uint8), cv2.IMREAD_COLOR)   # 画像を読み込む（カラー）
+    except (OSError, ValueError):
+        img = None
+    if img is None:
+        print(f"画像を読み込めません: {a.image}", file=sys.stderr)
+        sys.exit(1)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)       # グレースケール版も作る
     ocr = load_detector()                              # 検出モデル
-    sess = ort.InferenceSession("digit_cnn.onnx", providers=["CPUExecutionProvider"])   # 認識モデル
+    sess = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])   # 認識モデル
 
     # ---- 1〜5 を順に実行（時間も測る）----
     t0 = time.perf_counter()

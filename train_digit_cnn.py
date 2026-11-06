@@ -17,6 +17,14 @@ train_digit_cnn.py — 合成画像で「1桁の数字を読む CNN」を学習�
   python train_digit_cnn.py            # 12 エポック学習
   EPOCHS=4 python train_digit_cnn.py   # 短く試すとき
 
+  赤い小数桁専用モデルは、環境変数で入出力を切り替えて同じスクリプトで学習する
+  （引数を足すより差分が小さく、既定値では今までと完全に同じ動作になる）:
+    DATA=data/synth_red OUT=digit_cnn_red.onnx FLIP=0 python train_digit_cnn.py
+    DATA : 学習画像のフォルダ（既定 data/synth）
+    OUT  : 書き出す ONNX のファイル名（既定 digit_cnn.onnx。.pt も同じ名前で拡張子だけ替わる）
+    FLIP : 1 なら学習中に 50% で明暗反転（既定）。赤みチャネルは常に黒地に明るい字なので 0 にする
+    SEED : 指定したときだけ乱数を固定する
+
 ■ 用語
   エポック   : 全データを 1 周すること
   損失(loss) : 「どれくらい間違えているか」の数値。小さいほど良い
@@ -30,7 +38,9 @@ import torch.nn as nn        # ネットワークの部品（層）が入って�
 from PIL import Image
 
 # ================== 設定値 ==================
-DATA = "data/synth"                                  # 合成画像のフォルダ
+DATA = os.environ.get("DATA", "data/synth")          # 合成画像のフォルダ（赤桁用は data/synth_red）
+OUT = os.environ.get("OUT", "digit_cnn.onnx")        # 書き出す ONNX（赤桁用は digit_cnn_red.onnx。黒桁モデルを上書きしないこと）
+FLIP = os.environ.get("FLIP", "1") == "1"            # 明暗反転の augmentation（赤みチャネルは極性が一定なので赤桁用は 0）
 W, H = 28, 40                                        # 画像サイズ（synth_digits.py と同じ値）
 EPOCHS = int(os.environ.get("EPOCHS", 12))           # 環境変数 EPOCHS があればそれを使う。無ければ 12
 
@@ -98,6 +108,8 @@ def load():
 
 # ================== 学習 ==================
 def main():
+    if "SEED" in os.environ:             # 指定時のみ固定（既定は今までどおり未固定）
+        random.seed(int(os.environ["SEED"])); torch.manual_seed(int(os.environ["SEED"]))
     (xtr, ytr), (xva, yva) = load()      # tr = train（学習用）, va = validation（検証用）
     net = DigitNet()                     # ネットワークを作る（最初はでたらめな重み）
 
@@ -117,7 +129,7 @@ def main():
         for i in range(0, len(ytr), bs):
             b = perm[i:i + bs]           # このバッチに使う画像の番号
             xb = xtr[b]
-            if random.random() < 0.5:    # 50% の確率で明暗を反転（白地黒字にも強くする）
+            if FLIP and random.random() < 0.5:    # 50% の確率で明暗を反転（白地黒字にも強くする）
                 xb = 1 - xb
 
             opt.zero_grad()                       # 前回の勾配をリセット
@@ -135,15 +147,15 @@ def main():
         print(f"epoch {ep+1} loss {loss.item():.3f} val_acc {acc:.4f}")
 
     # ---- 保存 ----
-    torch.save(net.state_dict(), "digit_cnn.pt")     # PyTorch 形式（再学習用）
+    torch.save(net.state_dict(), os.path.splitext(OUT)[0] + ".pt")     # PyTorch 形式（再学習用）
 
     # ONNX 形式で書き出す。ONNX は PyTorch が無い環境（スマホ等）でも動かせる共通形式。
     #   torch.zeros(1,1,H,W) : 入力の形を教えるためのダミー画像
     #   dynamic_axes         : 1 枚でも 8 枚でもまとめて推論できるように「枚数」を可変にする
-    torch.onnx.export(net, torch.zeros(1, 1, H, W), "digit_cnn.onnx",
+    torch.onnx.export(net, torch.zeros(1, 1, H, W), OUT,
                       input_names=["x"], output_names=["logits"],
                       dynamic_axes={"x": {0: "n"}, "logits": {0: "n"}}, dynamo=False)
-    print("saved digit_cnn.onnx", os.path.getsize("digit_cnn.onnx") // 1024, "KB")
+    print("saved", OUT, os.path.getsize(OUT) // 1024, "KB")
 
 
 if __name__ == "__main__":

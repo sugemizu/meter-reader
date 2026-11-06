@@ -8,7 +8,8 @@ read_meter.py — 水道メーターの写真から数値を読み取る（本�
   2. 選択   : その中から「数字窓」らしいものを 1 つ選ぶ（横長・黒い背景・大きさ でスコア付け）
   3. 正面化 : 斜めに写った窓を、4 隅を基準に長方形に引き伸ばして正面向きにする
   4. 分割   : 窓を 1 桁ずつのセルに切り分ける
-  5. 分類   : 各セルを CNN (digit_cnn.onnx) に入れて数字を判定する
+  5. 分類   : 各セルを CNN に入れて数字を判定する
+              黒い桁は digit_cnn.onnx、赤い小数桁は専用の digit_cnn_red.onnx（赤みチャネルを入力にする）
 
 ■ 使い方
   python read_meter.py photo.jpg --digits 5 --red 1 --debug
@@ -30,6 +31,26 @@ import onnxruntime as ort
 # モデルはスクリプトの場所基準で読む（別ディレクトリから実行しても見つかるように）
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "digit_cnn.onnx")
 W, H = 28, 40    # CNN に入れる 1 桁画像のサイズ（学習時と同じ）
+
+# 赤い小数桁は黒桁と書体も見た目も違うので、専用モデルで読む（README の「赤い小数桁の専用モデル」）
+from red_input import red_cell_input, red_score_range, RED_EMPTY
+RED_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "digit_cnn_red.onnx")
+_RED_SESS = None    # 遅延読み込み。None=未読込、False=読めなかった（警告済み）
+
+
+def get_red_session():
+    """
+    赤桁モデルを 1 回だけ読んで返す。ファイルが無ければ警告を 1 回だけ stderr に出して None を返し、
+    呼び出し側は従来どおり黒桁のモデルで赤い桁も読む（赤桁モデルが無くても動くようにするため）
+    """
+    global _RED_SESS
+    if _RED_SESS is None:
+        if os.path.exists(RED_MODEL_PATH):
+            _RED_SESS = ort.InferenceSession(RED_MODEL_PATH, providers=["CPUExecutionProvider"])
+        else:
+            print("warning: digit_cnn_red.onnx が無いので赤い桁も黒桁のモデルで読みます", file=sys.stderr)
+            _RED_SESS = False
+    return _RED_SESS or None
 
 
 # ======================================================
@@ -396,7 +417,7 @@ def _cut_cell(win, c, cw, invert=False):
 
 
 def split_digits(win, n, win_color=None, red_digits=0, invert_black=False,
-                 win_red=None, info=None):
+                 win_red=None, info=None, win_red_color=None):
     """
     正面化した窓画像 win を n 桁のセルに分割する。
 
@@ -409,7 +430,9 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False,
       refine_vertical で枠を直したときは、精緻化前の枠で正面化した窓を渡す。黒桁は精緻化で良くなるが、
       回転中の赤桁（2→3）は切り出しのわずかな違いで CNN が 12 と 6 の間を揺れるため、赤桁の縦範囲は変えない
       （精緻化後の窓から切ると strict が 0.21 → 0.10 に落ちた）
-    info: dict を渡すと black_centers / red_centers / cw / red_fallback を書き込む（bench と --debug 用）
+    win_red_color: win_red のカラー版（赤桁モデル用）。win_red があるときはこちらから、無ければ win_color から
+      赤セルのカラー版を切り出して info["red_color_cells"] に入れる。戻り値のセル（グレー・赤は反転）は従来のまま
+    info: dict を渡すと black_centers / red_centers / cw / red_fallback / red_color_cells を書き込む（bench と --debug 用）
     戻り値: (セル画像のリスト, 処理後の窓画像)
     """
     h, w = win.shape
@@ -470,9 +493,18 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False,
         cells += [_cut_cell(win_red, c * sc, cw * sc, invert=True) for c in red_centers]
     else:
         cells += [_cut_cell(win, c, cw, invert=True) for c in red_centers]
+    # 赤桁モデル用のカラーのセル（反転しない。赤みは前処理 red_cell_input で取り出す）。切り出しの中心・幅は上の赤セルと同じ
+    red_color_cells = []
+    if win_color is not None:
+        if win_red is not None and win_red_color is not None:
+            sc = win_red_color.shape[1] / w
+            red_color_cells = [_cut_cell(win_red_color, c * sc, cw * sc) for c in red_centers]
+        else:
+            sc = win_color.shape[1] / w
+            red_color_cells = [_cut_cell(win_color, c * sc, cw * sc) for c in red_centers]
     if info is not None:
         info.update(black_centers=list(black_centers), red_centers=list(red_centers),
-                    cw=float(cw), red_fallback=red_fallback)
+                    cw=float(cw), red_fallback=red_fallback, red_color_cells=red_color_cells)
     return cells, win
 
 
@@ -595,6 +627,36 @@ def classify(sess, cells, tta=True, both_polarity=True):
     return prob.argmax(1), prob.max(1)      # 最も確率の高いラベル, その確率
 
 
+def classify_cells(sess, cells, red_digits=0, red_color_cells=None, dbg=None):
+    """
+    黒セルは従来の classify（位置ずらし 5 × 両極性 2）。赤セルは、赤モデルがあって赤みの幅が RED_EMPTY 以上なら
+    赤モデルで読み、それ以外（モデルが無い・赤が無い）は従来どおり反転グレーのセルを黒モデルで読む。
+    赤モデルの入力は赤みチャネル（黒地に明るい字）で片方の極性しか学習していないので、両極性は使わない。
+    位置ずらし 5 は残す（赤桁は切り出しのわずかな違いで 12 と 6 の間を揺れていたため）。
+    dbg: dict を渡すと赤セルごとの range と使ったモデル、赤モデルの入力画像を書き込む（--debug 用）
+    """
+    n_black = len(cells) - red_digits
+    labels, probs = classify(sess, cells[:n_black]) if n_black > 0 else (np.zeros(0, int), np.zeros(0))
+    labels, probs = list(labels), list(probs)
+    red_sess = get_red_session() if red_digits > 0 and red_color_cells else None
+    inputs, info = [], []
+    for k in range(red_digits):
+        x = None
+        rng = red_score_range(red_color_cells[k])[0]
+        if red_sess is not None and rng >= RED_EMPTY:
+            x = red_cell_input(red_color_cells[k])
+            l, p = classify(red_sess, [x], tta=True, both_polarity=False)
+            info.append((rng, "red"))
+        else:
+            l, p = classify(sess, [cells[n_black + k]])
+            info.append((rng, "black"))
+        inputs.append(x)
+        labels.append(l[0]); probs.append(p[0])
+    if dbg is not None:
+        dbg.update(red_info=info, red_inputs=inputs)
+    return np.array(labels), np.array(probs)
+
+
 def to_reading(labels, probs, red_digits=0):
     """
     桁ごとのラベルを「検針値の文字列」にまとめる。
@@ -680,9 +742,12 @@ def locate_and_read(img, gray, boxes, n, red_digits, invert_black, sess, debug=N
             q, rows = refine_vertical(gray, e, n, red_digits, invert_black, dbg=dbg)   # 2''. 上下の辺を帯に合わせる
             win, win_color = rectify(gray, q), rectify(img, q)
             win_red = rectify(gray, e) if rows is not None else None   # 赤セルは精緻化前の枠から切る
+            win_red_color = rectify(img, e) if rows is not None else None   # 赤桁モデル用のカラー版
             info = {}
-            cells, _ = split_digits(win, n, win_color, red_digits, invert_black, win_red=win_red, info=info)
-            labels, probs = classify(sess, cells)
+            cells, _ = split_digits(win, n, win_color, red_digits, invert_black, win_red=win_red, info=info,
+                                    win_red_color=win_red_color)
+            cdbg = {} if debug else None
+            labels, probs = classify_cells(sess, cells, red_digits, info["red_color_cells"], dbg=cdbg)
             rs = red_side_score(img, e, n) if red_digits > 0 else 0.0
         except (cv2.error, ValueError, IndexError, ZeroDivisionError) as ex:
             # 窓が壊れる・空配列になるなど「その向きでは読めない」失敗だけを候補から外す。
@@ -694,7 +759,7 @@ def locate_and_read(img, gray, boxes, n, red_digits, invert_black, sess, debug=N
         results.append(dict(labels=labels, probs=probs, score=score, rot=180 * k, refined=rows is not None,
                             red_fallback=info["red_fallback"], p_pick=p, p_ext=e, p_win=q, rows=rows,
                             win=win, win_color=win_color, win_red=win_red, cells=cells,
-                            centers=info["black_centers"] + info["red_centers"], cw=info["cw"], refine_dbg=dbg,
+                            centers=info["black_centers"] + info["red_centers"], cw=info["cw"], refine_dbg=dbg, red_dbg=cdbg,
                             conf_black=float(np.mean(probs[:n - red_digits])), rs=float(rs)))
     if not results:
         raise last_err
@@ -775,7 +840,9 @@ def main():
         cv2.putText(vis, f"rot={res['rot']}", (10, int(65 * fs) + 5), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 255, 0), 2)
         cv2.imwrite("debug_box.jpg", vis)
         cv2.imwrite("debug_window.png", res["win"])                        # 正面化した窓
-        cv2.imwrite("debug_cells.png", np.hstack(res["cells"]))            # 分割した各桁を横に並べて
+        rd = res["red_dbg"]
+        ins = [x for x in rd["red_inputs"] if x is not None] if rd else []
+        cv2.imwrite("debug_cells.png", np.hstack(res["cells"] + ins))      # 分割した各桁を横に並べて（右に赤桁モデルへの入力）
         # 精緻化の中間画像: 縦に広げた正面化画像（左）と行プロファイルの棒グラフ（右）
         d = res["refine_dbg"]
         if d:
@@ -797,6 +864,8 @@ def main():
         # 赤マスク: 正面化したカラー窓の下に赤マスクを並べる
         m, st = red_mask(res["win_color"], return_stats=True)
         cv2.imwrite("debug_redmask.png", np.vstack([res["win_color"], cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)]))
+        if rd and rd["red_info"]:
+            print("red_input: " + " ".join(f"range={r:.0f} model={m}" for r, m in rd["red_info"]))
         print("refine: " + (f"ok rows=({rows[0]},{rows[1]})" if rows else "fallback"))
         if a.red > 0:
             if res["red_fallback"]:

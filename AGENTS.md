@@ -20,8 +20,11 @@ Claude Code 固有の指揮ルールは `CLAUDE.md` を参照。
 |---|---|
 | `read_meter.py` | 推論の本体。検出 → 窓選択 → 正面化 → 桁分割 → CNN 分類 → 読み値生成 |
 | `synth_digits.py` | 合成データ生成（`data/synth/`）。フォント検索、手描き数字（平らな 3、直線の 6/9、開いた 4）、augmentation |
-| `train_digit_cnn.py` | CNN 学習と ONNX 書き出し |
+| `synth_red_digits.py` | 赤い小数桁専用の合成データ生成（`data/synth_red/`）。角型数字の描画、白い箱・目盛り帯・▶ つきのカラー合成、`red_input.py` で前処理して保存 |
+| `red_input.py` | 赤セルの前処理（赤みチャネル `R − max(G, B)` の正規化）。学習と推論で共通、numpy のみ |
+| `train_digit_cnn.py` | CNN 学習と ONNX 書き出し（環境変数 `DATA` / `OUT` / `FLIP` / `SEED` で赤桁用に切り替え） |
 | `digit_cnn.onnx` | 学習済み認識モデル（コミット済み。再学習しない限り触らない） |
+| `digit_cnn_red.onnx` | 赤い小数桁専用の学習済みモデル（コミット済み。ユーザーが明示しない限り再学習しない） |
 | `requirements.txt` | torch / onnx / onnxruntime / opencv-python-headless / pillow / rapidocr-onnxruntime |
 
 `data/`, `in/`, `debug_*`, `*.pt` は `.gitignore` 済み。生成物やテスト画像をコミットしない。
@@ -32,6 +35,8 @@ Claude Code 固有の指揮ルールは `CLAUDE.md` を参照。
 pip install -r requirements.txt
 python synth_digits.py                              # 合成データ生成
 python train_digit_cnn.py                           # 学習 → digit_cnn.onnx
+python synth_red_digits.py                          # 赤桁用の合成データ生成
+DATA=data/synth_red OUT=digit_cnn_red.onnx FLIP=0 python train_digit_cnn.py   # 赤桁用の学習
 python read_meter.py photo.jpg --digits 5 --red 1 --debug   # 推論
 ```
 

@@ -282,7 +282,9 @@ def split_digits(win, n, win_color=None, red_digits=0, invert_black=False):
         # 赤い桁は黒い桁より右側にあるはず。天地逆の写真や窓の左に赤い線・枠があると、
         # 左の赤を赤い桁と誤認して黒い桁の領域が潰れ、空セルになって落ちていたので、
         # 黒い桁の領域（の手前）より左の赤は無視して、赤の探索を窓の右側に限定する
-        proj_r[:max(0, int(w * n_black / n - h * 0.3))] = 0
+        # 余白は h*0.8。斜めの写真で窓の右に余白が付くと赤い桁が左に寄るため、
+        # 黒い桁の領域の境界からやや左まで許す（赤が窓の左端 x≈0.1w にある元の落ちる例は依然として除外される）
+        proj_r[:max(0, int(w * n_black / n - h * 0.8))] = 0
         red_centers = _pick_peaks(proj_r, red_digits, min_dist=h * 0.4) or []
     # 赤が見つからなければ、右端を赤い桁とみなす（フォールバック）
     if len(red_centers) < red_digits:
